@@ -127,7 +127,7 @@ func ensureSSHConfig() {
     HostName %s
     User %s
 
-    # 连接复用：避免多次 SSH 握手触发服务端限流
+
     ControlMaster auto
     ControlPath /tmp/spod-ssh-%%r@%%h:%%p
     ControlPersist 300
@@ -143,12 +143,13 @@ func ensureSSHConfig() {
 
 	// Check if superpod block exists and is up to date
 	if strings.Contains(content, "Host superpod") {
-		// Check if config already matches desired
-		if strings.Contains(content, "ControlMaster auto") &&
-			strings.Contains(content, "User "+sshUser) {
+		if strings.Contains(content, "HostName "+sshHost) &&
+			strings.Contains(content, "User "+sshUser) &&
+			strings.Contains(content, "ControlMaster auto") {
 			return // already correct
 		}
-		// Config outdated — replace the whole superpod block
+		// Config mismatch — replace the whole superpod block
+
 		// Find block boundaries (from "Host superpod" to next "Host " or EOF)
 		lines := strings.Split(content, "\n")
 		var result []string
@@ -450,6 +451,32 @@ func ensurePorts() {
 	}
 }
 
+func tunnelLooksAlive() bool {
+	cmd := exec.Command("ssh",
+		"-o", "ConnectTimeout=5",
+		"-o", "BatchMode=yes",
+		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
+		host, "true",
+	)
+	return cmd.Run() == nil
+}
+
+func killTunnel(pid int) {
+	if pid <= 0 {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+}
+
 func ensureVPN() {
 	if vpnTunnelUp() {
 		return
@@ -503,17 +530,13 @@ func ensureTunnel() {
 
 	pid, _ := tunnelPIDAndPort()
 	if pid > 0 {
-		// PID exists and matches expected port — verify the underlying
-		// SSH connection is still alive
-		probe := exec.Command("ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", host, "true")
-		if err := probe.Run(); err != nil {
-			warn(fmt.Sprintf("隧道进程存在 (pid=%d) 但 SSH 连接已断，重建...", pid))
-			killTunnelPID(pid)
-			time.Sleep(2 * time.Second)
-		} else {
-			ok(fmt.Sprintf("隧道运行中 (pid=%d, port=%s)", pid, tunnelPort))
+		if tunnelLooksAlive() {
+			ok(fmt.Sprintf("隧道运行中 (pid=%d)", pid))
 			return
 		}
+		warn(fmt.Sprintf("隧道进程存在 (pid=%d) 但 SSH 连接已断，重建...", pid))
+		info(fmt.Sprintf("清理旧隧道并重建 (远端:%s -> 本地:%s)...", tunnelPort, localPort))
+		killTunnel(pid)
 	}
 
 	info(fmt.Sprintf("启动隧道 (SuperPod:%s → 本地:%s)...", tunnelPort, localPort))
@@ -530,6 +553,8 @@ func ensureTunnel() {
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "TCPKeepAlive=yes",
 		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
+
 		"-R", fmt.Sprintf("%s:127.0.0.1:%s", tunnelPort, localPort),
 		host,
 	)
@@ -550,11 +575,11 @@ func ensureTunnel() {
 		logFile.Close()
 	}
 
-	// Poll until tunnel process appears (max 10s)
-	deadline := time.Now().Add(10 * time.Second)
+	// Poll until tunnel process appears (max 20s). autossh may fork twice.
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if tunnelPID() > 0 {
-			ok("隧道已建立")
+		if pid := tunnelPID(); pid > 0 {
+			ok(fmt.Sprintf("隧道已建立 (pid=%d)", pid))
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
@@ -1548,6 +1573,10 @@ SPOD_EOF`,
 	}
 }
 
+func tmuxMouseCmd() string {
+	return `grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf`
+}
+
 // relayScript is a TCP relay proxy with retry, deployed to SuperPod.
 // It sits between claude/codex and the SSH tunnel, absorbing short outages
 // by retrying upstream connections instead of immediately failing.
@@ -1749,10 +1778,19 @@ echo "BROKEN:${broken# }"
 	info(fmt.Sprintf("重装完成: %s", strings.TrimSpace(fixOut)))
 }
 
+
+func ensureProxyIfTunnelRunning() {
+	if tunnelPID() == 0 {
+		return
+	}
+	ensureRelay()
+	ensureRemoteProxy()
+}
+
 func attachOrCreate(name string) {
-	ensureRemoteSetup()
+	ensureProxyIfTunnelRunning()
 	info(fmt.Sprintf("连接到 %s%s%s ...", bold, name, reset))
-	if err := sshInteractive(fmt.Sprintf("tmux attach -t %s 2>/dev/null || tmux new -s %s", name, name)); err != nil {
+	if err := sshInteractive(fmt.Sprintf("%s; tmux attach -t %s 2>/dev/null || tmux new -s %s", tmuxMouseCmd(), name, name)); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 255 {
 			fail("SSH 连接失败")
@@ -1783,9 +1821,9 @@ func cmdNew(name string) {
 	} else {
 		name = fullName(name)
 	}
-	ensureRemoteSetup()
+	ensureProxyIfTunnelRunning()
 	info(fmt.Sprintf("创建会话 %s%s%s ...", bold, name, reset))
-	if err := sshInteractive(fmt.Sprintf("tmux new -s %s", name)); err != nil {
+	if err := sshInteractive(fmt.Sprintf("%s; tmux new -s %s", tmuxMouseCmd(), name)); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 255 {
 			fail("SSH 连接失败")
@@ -2058,24 +2096,24 @@ func main() {
 	case "vscode":
 		cmdVscode()
 	case "ls":
-		ensureTunnel()
+		ensureVPN()
 		cmdLs()
 	case "new":
-		ensureTunnel()
+		ensureVPN()
 		name := ""
 		if len(args) > 1 {
 			name = args[1]
 		}
 		cmdNew(name)
 	case "kill":
-		ensureTunnel()
+		ensureVPN()
 		name := ""
 		if len(args) > 1 {
 			name = args[1]
 		}
 		cmdKill(name)
 	case "killall":
-		ensureTunnel()
+		ensureVPN()
 		cmdKillAll()
 	case "sync":
 		if len(args) > 1 && args[1] == "stop" {
@@ -2101,7 +2139,7 @@ func main() {
 	case "uptime":
 		cmdUptime()
 	case "ssh":
-		ensureTunnel()
+		ensureVPN()
 		if err := sshInteractive(); err != nil {
 			var exitErr *exec.ExitError
 			if errors.As(err, &exitErr) {
@@ -2111,10 +2149,10 @@ func main() {
 			os.Exit(1)
 		}
 	case "":
-		ensureTunnel()
+		ensureVPN()
 		cmdInteractive()
 	default:
-		ensureTunnel()
+		ensureVPN()
 		attachOrCreate(fullName(cmd))
 	}
 }
